@@ -77,6 +77,17 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "export PATH=\"$HOME/go/bin:$HOME/bin:$PATH\" && gt done --guard --status DEFERRED 2>/dev/null || true"
+          }
+        ]
+      }
     ]
   }
 }

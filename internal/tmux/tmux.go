@@ -2515,10 +2515,11 @@ func (t *Tmux) SetPaneDiedHook(session, agentID string) error {
 	agentID = strings.ReplaceAll(agentID, "'", "'\\''")
 	session = strings.ReplaceAll(session, "'", "'\\''") // safe after validation, but keep for consistency
 
-	// Hook command logs the crash with exit status
-	// #{pane_dead_status} is the exit code of the process that died
-	// We run gt log crash which records to the town log
-	hookCmd := fmt.Sprintf(`run-shell "gt log crash --agent '%s' --session '%s' --exit-code #{pane_dead_status}"`,
+	// Hook command logs the crash with exit status AND attempts gt done --guard
+	// as a backstop for polecats that exit without running gt done (gt-8gq).
+	// The --guard flag makes this a no-op if gt done already ran successfully.
+	// #{pane_dead_status} is the exit code of the process that died.
+	hookCmd := fmt.Sprintf(`run-shell "gt log crash --agent '%s' --session '%s' --exit-code #{pane_dead_status}; gt done --guard --status DEFERRED 2>/dev/null || true"`,
 		agentID, session)
 
 	// Set the hook on this specific session

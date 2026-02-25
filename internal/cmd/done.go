@@ -49,7 +49,8 @@ Examples:
   gt done                              # Submit branch, notify COMPLETED, exit session
   gt done --issue gt-abc               # Explicit issue ID
   gt done --status ESCALATED           # Signal blocker, skip MR
-  gt done --status DEFERRED            # Pause work, skip MR`,
+  gt done --status DEFERRED            # Pause work, skip MR
+  gt done --guard --status DEFERRED    # Only run if work still pending (SessionEnd hook)`,
 	RunE:         runDone,
 	SilenceUsage: true, // Don't print usage on operational errors (confuses agents)
 }
@@ -60,6 +61,7 @@ var (
 	doneStatus        string
 	doneCleanupStatus string
 	doneResume        bool
+	doneGuard         bool
 )
 
 // Valid exit types for gt done
@@ -75,6 +77,7 @@ func init() {
 	doneCmd.Flags().StringVar(&doneStatus, "status", ExitCompleted, "Exit status: COMPLETED, ESCALATED, or DEFERRED")
 	doneCmd.Flags().StringVar(&doneCleanupStatus, "cleanup-status", "", "Git cleanup status: clean, uncommitted, unpushed, stash, unknown (ZFC: agent-observed)")
 	doneCmd.Flags().BoolVar(&doneResume, "resume", false, "Resume from last checkpoint (auto-detected, for Witness recovery)")
+	doneCmd.Flags().BoolVar(&doneGuard, "guard", false, "Only run if work is still pending (for SessionEnd hooks; no-op if already completed)")
 
 	rootCmd.AddCommand(doneCmd)
 }
@@ -329,6 +332,29 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			deferredTownRoot = townRoot
 			deferredRoleInfo = roleInfo
 		}
+	}
+
+	// --guard: Exit early if no work is pending on this agent's hook.
+	// Used by SessionEnd hooks to avoid double-running gt done when the agent
+	// already completed successfully. Also safe for pane-died backstop hooks.
+	// BUG FIX (gt-8gq): Without this, polecats that exit without running gt done
+	// leave orphaned HOOKED beads. The SessionEnd hook calls gt done --guard to
+	// catch this case, and this flag makes the second invocation a no-op.
+	if doneGuard && agentBeadID != "" {
+		bd := beads.New(beads.ResolveBeadsDir(cwd))
+		agentBead, err := bd.Show(agentBeadID)
+		if err != nil {
+			// Agent bead not found — nothing to guard, exit cleanly
+			fmt.Printf("%s Guard: agent bead %s not found, nothing to do\n", style.Bold.Render("✓"), agentBeadID)
+			return nil
+		}
+		if agentBead.HookBead == "" {
+			// No hooked work — gt done already completed or work was never assigned
+			fmt.Printf("%s Guard: no hooked work on %s, nothing to do\n", style.Bold.Render("✓"), agentBeadID)
+			return nil
+		}
+		// Hook still set — work is pending, proceed with full gt done
+		fmt.Printf("%s Guard: hooked bead %s still pending, proceeding with gt done\n", style.Bold.Render("→"), agentBead.HookBead)
 	}
 
 	// If issue ID not set by flag or branch name, try agent's hook_bead.
