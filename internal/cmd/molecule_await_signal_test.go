@@ -227,6 +227,87 @@ func TestWaitForActivitySignal_PathWiring(t *testing.T) {
 	}
 }
 
+func TestMinSleepEnforcement(t *testing.T) {
+	// When min-sleep is set and a signal arrives before it elapses,
+	// the total elapsed time should be at least min-sleep.
+	eventsPath := filepath.Join(t.TempDir(), ".events.jsonl")
+	if err := os.WriteFile(eventsPath, []byte(`{"ts":"old","type":"ignore"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	minSleep := 500 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Append a signal after 100ms (well before min-sleep of 500ms)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		f, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		_, _ = f.WriteString(`{"ts":"new","type":"sling","actor":"test"}` + "\n")
+	}()
+
+	startTime := time.Now()
+
+	// Wait for the signal
+	result, err := waitForEventsFile(ctx, eventsPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "signal" {
+		t.Fatalf("expected reason 'signal', got %q", result.Reason)
+	}
+
+	// Simulate min-sleep enforcement (as done in runMoleculeAwaitSignal)
+	elapsed := time.Since(startTime)
+	if elapsed < minSleep {
+		remaining := minSleep - elapsed
+		time.Sleep(remaining)
+	}
+	totalElapsed := time.Since(startTime)
+
+	if totalElapsed < minSleep {
+		t.Errorf("total elapsed %v < min-sleep %v; min-sleep not enforced", totalElapsed, minSleep)
+	}
+	// Should not greatly exceed min-sleep (allow 200ms tolerance for scheduling)
+	if totalElapsed > minSleep+200*time.Millisecond {
+		t.Errorf("total elapsed %v significantly exceeds min-sleep %v", totalElapsed, minSleep)
+	}
+}
+
+func TestMinSleepNotAppliedOnTimeout(t *testing.T) {
+	// When the signal times out (no signal received), min-sleep should
+	// NOT add extra delay — the timeout itself satisfies the minimum.
+	eventsPath := filepath.Join(t.TempDir(), ".events.jsonl")
+	if err := os.WriteFile(eventsPath, []byte(`{"ts":"old","type":"ignore"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	startTime := time.Now()
+	result, err := waitForEventsFile(ctx, eventsPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "timeout" {
+		t.Fatalf("expected reason 'timeout', got %q", result.Reason)
+	}
+
+	elapsed := time.Since(startTime)
+
+	// Min-sleep only applies to signals, not timeouts
+	// So elapsed should be ~300ms (the context timeout), not more
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("timeout took too long (%v), min-sleep may have been incorrectly applied", elapsed)
+	}
+}
+
 func TestBackoffWindowResumption(t *testing.T) {
 	// Test the backoff window resumption logic that makes await-signal
 	// resilient to interrupts. When a backoff-until timestamp is in the

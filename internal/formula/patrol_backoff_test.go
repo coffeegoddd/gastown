@@ -71,6 +71,45 @@ func TestPatrolFormulasHaveBackoffLogic(t *testing.T) {
 	}
 }
 
+// TestDeaconPatrolHasMinSleep verifies that the deacon patrol formula includes
+// --min-sleep in its loop-or-exit step to prevent burning context window
+// when background events generate constant activity.
+//
+// Without min-sleep, the await-signal returns immediately on any event from
+// concurrent system components (daemon heartbeats, other agents), causing the
+// deacon to blast through 15-20 empty patrol cycles at API speed.
+//
+// See: gt-1y8 (deacon patrol burns context window)
+func TestDeaconPatrolHasMinSleep(t *testing.T) {
+	content, err := formulasFS.ReadFile("formulas/mol-deacon-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading deacon patrol formula: %v", err)
+	}
+
+	f, err := Parse(content)
+	if err != nil {
+		t.Fatalf("parsing deacon patrol formula: %v", err)
+	}
+
+	var loopDesc string
+	for _, step := range f.Steps {
+		if step.ID == "loop-or-exit" {
+			loopDesc = step.Description
+			break
+		}
+	}
+	if loopDesc == "" {
+		t.Fatal("loop-or-exit step not found or has empty description")
+	}
+
+	if !strings.Contains(loopDesc, "--min-sleep") {
+		t.Errorf("deacon patrol loop-or-exit step missing --min-sleep flag\n" +
+			"The deacon patrol must use --min-sleep to enforce a minimum delay between\n" +
+			"patrol cycles, preventing context window burn from background event noise.\n" +
+			"See: gt-1y8")
+	}
+}
+
 // TestPatrolFormulasHaveSquashCycle verifies that all three patrol formulas
 // include the squash/create-wisp/hook cycle in their loop step.
 //

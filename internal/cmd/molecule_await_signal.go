@@ -24,6 +24,7 @@ var (
 	awaitSignalBackoffBase string
 	awaitSignalBackoffMult int
 	awaitSignalBackoffMax  string
+	awaitSignalMinSleep    string
 	awaitSignalQuiet       bool
 	awaitSignalAgentBead   string
 )
@@ -51,6 +52,15 @@ The idle_cycles value is read from the agent bead's "idle" label, enabling
 exponential backoff that persists across invocations. When a signal is
 received, the caller should reset idle:0 on the agent bead.
 
+MIN-SLEEP MODE:
+When --min-sleep is specified, the command guarantees a minimum wait time
+before returning, even if a signal arrives sooner. This prevents patrol
+agents from burning through cycles when background activity (daemon
+heartbeats, other agents) generates a constant stream of events.
+
+If a signal arrives before min-sleep elapses, the command continues waiting
+until the min-sleep duration passes, then returns with reason "signal".
+
 EXIT CODES:
   0 - Signal received or timeout (check output for which)
   1 - Error opening events file
@@ -62,6 +72,10 @@ EXAMPLES:
   # Backoff mode with agent bead tracking:
   gt mol await-signal --agent-bead gt-gastown-witness \
     --backoff-base 30s --backoff-mult 2 --backoff-max 5m
+
+  # Patrol mode: sleep at least 60s even if signals arrive immediately
+  gt mol await-signal --agent-bead hq-deacon \
+    --backoff-base 60s --backoff-mult 2 --backoff-max 5m --min-sleep 60s
 
   # On timeout, the agent bead's idle:N label is auto-incremented
   # On signal, caller should reset: gt agent state gt-gastown-witness --set idle=0
@@ -88,6 +102,8 @@ func init() {
 		"Multiplier for exponential backoff (default: 2)")
 	moleculeAwaitSignalCmd.Flags().StringVar(&awaitSignalBackoffMax, "backoff-max", "",
 		"Maximum interval cap for backoff (e.g., 10m)")
+	moleculeAwaitSignalCmd.Flags().StringVar(&awaitSignalMinSleep, "min-sleep", "",
+		"Minimum time to wait before returning, even if a signal arrives (e.g., 60s)")
 	moleculeAwaitSignalCmd.Flags().StringVar(&awaitSignalAgentBead, "agent-bead", "",
 		"Agent bead ID for tracking idle cycles (reads/writes idle:N label)")
 	moleculeAwaitSignalCmd.Flags().BoolVar(&awaitSignalQuiet, "quiet", false,
@@ -135,6 +151,15 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 					backoffUntil = time.Unix(int64(ts), 0)
 				}
 			}
+		}
+	}
+
+	// Parse min-sleep duration if specified
+	var minSleep time.Duration
+	if awaitSignalMinSleep != "" {
+		minSleep, err = time.ParseDuration(awaitSignalMinSleep)
+		if err != nil {
+			return fmt.Errorf("invalid min-sleep: %w", err)
 		}
 	}
 
@@ -197,6 +222,19 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	}
 
 	result.Elapsed = time.Since(startTime)
+
+	// Enforce min-sleep: if a signal arrived before the minimum sleep
+	// duration, wait for the remainder. This prevents patrol agents from
+	// burning through cycles when background events are constant.
+	if minSleep > 0 && result.Reason == "signal" && result.Elapsed < minSleep {
+		remaining := minSleep - result.Elapsed
+		if !awaitSignalQuiet && !moleculeJSON {
+			fmt.Printf("%s Signal received early, enforcing min-sleep (%v remaining)...\n",
+				style.Dim.Render("💤"), remaining.Round(time.Second))
+		}
+		time.Sleep(remaining)
+		result.Elapsed = time.Since(startTime)
+	}
 
 	// On timeout, increment idle cycles and clear backoff window
 	if result.Reason == "timeout" && awaitSignalAgentBead != "" {
