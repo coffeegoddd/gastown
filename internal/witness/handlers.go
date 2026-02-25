@@ -1379,14 +1379,93 @@ func getBeadStatus(workDir, beadID string) string {
 	return issues[0].Status
 }
 
+// moleculeProgress holds progress info for an attached molecule, queried via bd CLI.
+type moleculeProgress struct {
+	TotalSteps int
+	DoneSteps  int
+}
+
+// getMoleculeProgress checks the progress of a bead's attached molecule via bd CLI.
+// Returns nil if the bead has no attached molecule or progress can't be determined.
+func getMoleculeProgress(workDir, beadID string) *moleculeProgress {
+	molID := getAttachedMoleculeID(workDir, beadID)
+	if molID == "" {
+		return nil
+	}
+
+	// List children of the molecule to count closed vs total steps.
+	output, err := util.ExecWithOutput(workDir, "bd", "list", "--parent="+molID, "--status=all", "--json", "--limit=0")
+	if err != nil || output == "" {
+		return nil
+	}
+
+	var children []struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(output), &children); err != nil || len(children) == 0 {
+		return nil
+	}
+
+	p := &moleculeProgress{TotalSteps: len(children)}
+	for _, child := range children {
+		if child.Status == "closed" {
+			p.DoneSteps++
+		}
+	}
+	return p
+}
+
+// closeCompletedBead closes a bead whose molecule work is complete, instead of
+// resetting it for re-dispatch. This prevents the zombie respawn loop where a
+// polecat exits after completing work but without running gt done.
+func closeCompletedBead(workDir, rigName, hookBead, polecatName string, progress *moleculeProgress, router *mail.Router) bool {
+	reason := fmt.Sprintf("no-changes: witness auto-closed — molecule work complete (%d/%d steps done), polecat %s exited without gt done",
+		progress.DoneSteps, progress.TotalSteps, polecatName)
+	if err := util.ExecRun(workDir, "bd", "close", hookBead, "-r", reason); err != nil {
+		return false
+	}
+
+	// Also close the attached molecule and its descendants.
+	molID := getAttachedMoleculeID(workDir, hookBead)
+	if molID != "" {
+		_, _ = closeMoleculeWithDescendants(workDir, molID)
+	}
+
+	// Notify witness/deacon that work was auto-completed (not re-dispatched).
+	if router != nil {
+		msg := &mail.Message{
+			From:     fmt.Sprintf("%s/witness", rigName),
+			To:       "deacon/",
+			Subject:  fmt.Sprintf("ZOMBIE_AUTO_CLOSED %s", hookBead),
+			Priority: mail.PriorityNormal,
+			Body: fmt.Sprintf(`Witness auto-closed abandoned bead — molecule work was already complete.
+
+Bead: %s
+Polecat: %s/%s
+Molecule Progress: %d/%d steps closed
+
+The polecat exited without running gt done, but all molecule steps were
+already closed. The bead has been closed instead of re-dispatched to
+prevent a zombie respawn loop.`,
+				hookBead, rigName, polecatName, progress.DoneSteps, progress.TotalSteps),
+		}
+		_ = router.Send(msg) // Best-effort
+	}
+
+	return true
+}
+
 // resetAbandonedBead resets a dead polecat's hooked bead so it can be re-dispatched.
 // If the bead is in "hooked" or "in_progress" status, it:
-// 1. Records the respawn in the witness spawn-count ledger
-// 2. Resets status to open
-// 3. Clears assignee
-// 4. Sends mail to deacon for re-dispatch (includes respawn count; SPAWN_STORM
+// 1. Checks if the attached molecule's work is already complete — if so, closes
+//    the bead instead of resetting (prevents zombie respawn loops, see gt-3p9)
+// 2. Records the respawn in the witness spawn-count ledger
+// 3. Resets status to open
+// 4. Clears assignee
+// 5. Sends mail to deacon for re-dispatch (includes respawn count; SPAWN_STORM
 //    prefix and Urgent priority when count exceeds defaultMaxBeadRespawns)
-// Returns true if the bead was recovered.
+// Returns true if the bead was recovered (either closed or reset).
 func resetAbandonedBead(workDir, rigName, hookBead, polecatName string, router *mail.Router) bool {
 	if hookBead == "" {
 		return false
@@ -1394,6 +1473,16 @@ func resetAbandonedBead(workDir, rigName, hookBead, polecatName string, router *
 	status := getBeadStatus(workDir, hookBead)
 	if status != "hooked" && status != "in_progress" {
 		return false
+	}
+
+	// Check if the molecule work is already complete. If so, close the bead
+	// rather than resetting for re-dispatch. This prevents the zombie loop
+	// where a polecat exits after finishing work but without running gt done,
+	// causing witness to respawn a new session with no context. (gt-3p9)
+	if progress := getMoleculeProgress(workDir, hookBead); progress != nil && progress.TotalSteps > 0 {
+		if progress.DoneSteps == progress.TotalSteps {
+			return closeCompletedBead(workDir, rigName, hookBead, polecatName, progress, router)
+		}
 	}
 
 	// Track respawn count for audit and storm detection.

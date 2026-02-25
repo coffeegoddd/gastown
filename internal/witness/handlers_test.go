@@ -1297,3 +1297,192 @@ esac
 	}
 }
 
+// writeMockBdForReset creates a mock bd script that simulates bead state for
+// testing resetAbandonedBead and getMoleculeProgress. The hookBead will report
+// the given status, optionally with an attached molecule whose children have
+// the given closed/total step counts.
+func writeMockBdForReset(t *testing.T, tmpDir, hookBead, beadStatus, moleculeID string, closedSteps, totalSteps int) string {
+	t.Helper()
+	logFile := filepath.Join(tmpDir, "bd.log")
+	mockBd := filepath.Join(tmpDir, "bd")
+
+	// Build step JSON for molecule children
+	var stepsJSON strings.Builder
+	stepsJSON.WriteString("[")
+	for i := 0; i < totalSteps; i++ {
+		if i > 0 {
+			stepsJSON.WriteString(",")
+		}
+		st := "open"
+		if i < closedSteps {
+			st = "closed"
+		}
+		stepsJSON.WriteString(fmt.Sprintf(`{"id":"gt-step-%03d","status":"%s"}`, i+1, st))
+	}
+	stepsJSON.WriteString("]")
+
+	descField := ""
+	if moleculeID != "" {
+		descField = fmt.Sprintf(`attached_molecule: %s\nattached_at: 2026-01-15T10:00:00Z`, moleculeID)
+	}
+
+	// Build show cases — only include molecule case if moleculeID is set
+	molShowCase := ""
+	if moleculeID != "" {
+		molShowCase = fmt.Sprintf(`      %s)
+        echo '[{"status":"open","description":""}]'
+        ;;`, moleculeID)
+	}
+
+	// Build list case — only include molecule parent match if moleculeID is set
+	molListCase := ""
+	if moleculeID != "" {
+		molListCase = fmt.Sprintf(`      *--parent=%s*)
+        cat <<'EOJSON'
+%s
+EOJSON
+        ;;`, moleculeID, stepsJSON.String())
+	}
+
+	mockScript := fmt.Sprintf(`#!/bin/bash
+echo "$@" >> %s
+case "$1" in
+  show)
+    case "$2" in
+      %s)
+        echo '[{"status":"%s","description":"%s"}]'
+        ;;
+%s
+      *)
+        echo '[{"status":"open","description":""}]'
+        ;;
+    esac
+    ;;
+  list)
+    case "$*" in
+%s
+      *)
+        echo '[]'
+        ;;
+    esac
+    ;;
+  close)
+    ;;
+  update)
+    ;;
+  *)
+    ;;
+esac
+`, logFile, hookBead, beadStatus, descField, molShowCase, molListCase)
+
+	if err := os.WriteFile(mockBd, []byte(mockScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", tmpDir+":"+os.Getenv("PATH"))
+	return logFile
+}
+
+func TestGetMoleculeProgress_NoMolecule(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Mock bd that returns a bead with no attached_molecule
+	writeMockBdForReset(t, tmpDir, "gt-bead-1", "hooked", "", 0, 0)
+
+	progress := getMoleculeProgress(tmpDir, "gt-bead-1")
+	if progress != nil {
+		t.Error("expected nil progress for bead without attached molecule")
+	}
+}
+
+func TestGetMoleculeProgress_AllClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeMockBdForReset(t, tmpDir, "gt-bead-1", "hooked", "gt-mol-1", 5, 5)
+
+	progress := getMoleculeProgress(tmpDir, "gt-bead-1")
+	if progress == nil {
+		t.Fatal("expected non-nil progress")
+	}
+	if progress.TotalSteps != 5 {
+		t.Errorf("TotalSteps = %d, want 5", progress.TotalSteps)
+	}
+	if progress.DoneSteps != 5 {
+		t.Errorf("DoneSteps = %d, want 5", progress.DoneSteps)
+	}
+}
+
+func TestGetMoleculeProgress_Partial(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeMockBdForReset(t, tmpDir, "gt-bead-1", "hooked", "gt-mol-1", 3, 10)
+
+	progress := getMoleculeProgress(tmpDir, "gt-bead-1")
+	if progress == nil {
+		t.Fatal("expected non-nil progress")
+	}
+	if progress.TotalSteps != 10 {
+		t.Errorf("TotalSteps = %d, want 10", progress.TotalSteps)
+	}
+	if progress.DoneSteps != 3 {
+		t.Errorf("DoneSteps = %d, want 3", progress.DoneSteps)
+	}
+}
+
+func TestResetAbandonedBead_ClosesCompleteMolecule(t *testing.T) {
+	tmpDir := t.TempDir()
+	// All 5 steps closed — molecule work is complete
+	logFile := writeMockBdForReset(t, tmpDir, "gt-bead-1", "hooked", "gt-mol-1", 5, 5)
+
+	recovered := resetAbandonedBead(tmpDir, "testrig", "gt-bead-1", "nux", nil)
+	if !recovered {
+		t.Error("expected bead to be recovered (closed)")
+	}
+
+	// Verify bd close was called (not bd update --status=open)
+	logBytes, _ := os.ReadFile(logFile)
+	logContent := string(logBytes)
+	if !strings.Contains(logContent, "close gt-bead-1 -r") {
+		t.Errorf("expected bd close for completed bead, got log:\n%s", logContent)
+	}
+	// Should NOT have reset to open
+	if strings.Contains(logContent, "update gt-bead-1 --status=open") {
+		t.Errorf("should NOT reset completed bead to open, got log:\n%s", logContent)
+	}
+}
+
+func TestResetAbandonedBead_ResetsIncompleteMolecule(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Only 3 of 10 steps closed — molecule work is NOT complete
+	logFile := writeMockBdForReset(t, tmpDir, "gt-bead-1", "hooked", "gt-mol-1", 3, 10)
+
+	recovered := resetAbandonedBead(tmpDir, "testrig", "gt-bead-1", "nux", nil)
+	if !recovered {
+		t.Error("expected bead to be recovered (reset)")
+	}
+
+	// Verify bd update --status=open was called (re-dispatch)
+	logBytes, _ := os.ReadFile(logFile)
+	logContent := string(logBytes)
+	if !strings.Contains(logContent, "update gt-bead-1 --status=open") {
+		t.Errorf("expected bd update --status=open for incomplete bead, got log:\n%s", logContent)
+	}
+	// Should NOT have closed
+	if strings.Contains(logContent, "close gt-bead-1 -r") {
+		t.Errorf("should NOT close incomplete bead, got log:\n%s", logContent)
+	}
+}
+
+func TestResetAbandonedBead_ResetsBeadWithoutMolecule(t *testing.T) {
+	tmpDir := t.TempDir()
+	// No molecule attached — should reset normally
+	logFile := writeMockBdForReset(t, tmpDir, "gt-bead-1", "hooked", "", 0, 0)
+
+	recovered := resetAbandonedBead(tmpDir, "testrig", "gt-bead-1", "nux", nil)
+	if !recovered {
+		t.Error("expected bead to be recovered (reset)")
+	}
+
+	logBytes, _ := os.ReadFile(logFile)
+	logContent := string(logBytes)
+	if !strings.Contains(logContent, "update gt-bead-1 --status=open") {
+		t.Errorf("expected bd update --status=open for bead without molecule, got log:\n%s", logContent)
+	}
+}
+
